@@ -5,7 +5,6 @@ from datetime import date
 import io
 import json
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 from types import ModuleType
@@ -81,9 +80,8 @@ class DatasetCacheTests(unittest.TestCase):
         state,_=snapshot_fixture()
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'cache'
-            manifest=cache.save_cache(path,state,'fixture',part_bytes=1024)
-            self.assertGreater(len(manifest['parts']),1)
-            self.assertTrue(all(p['bytes']<=1024 for p in manifest['parts']))
+            cache.save_cache(path,state,'fixture')
+            self.assertTrue(path.is_file())
             ns=namespace()
             with patch.object(cache.torch,'load',wraps=cache.torch.load) as loader:
                 loaded=cache.load_cache(path,'fixture',{name:ns[name] for name in cache.DATA_CLASSES})
@@ -107,31 +105,20 @@ class DatasetCacheTests(unittest.TestCase):
             self.assertEqual(cache.load_cache(path,'spec',{})['values'],[1.2,3,True,date(2022,1,1)])
         with self.assertRaises(TypeError):cache._encode(torch.nn.Linear(2,1))
 
-    def test_mismatch_is_rejected_before_unpickling(self):
+    def test_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'cache';cache.save_cache(path,dict(a=torch.arange(3)),'old')
-            with patch.object(cache.torch,'load',side_effect=AssertionError('must not load')):
-                with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{})
+            path=Path(temp)/'cache.pt';cache.save_cache(path,dict(a=torch.arange(3)),'old')
+            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{})
 
-    def test_checksums_missing_parts_and_unsafe_paths_are_rejected(self):
+    def test_failed_save_preserves_previous_file(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'cache';m=cache.save_cache(path,dict(a=torch.arange(30)),'spec',part_bytes=200)
-            part=path/m['parts'][0]['name'];original=part.read_bytes();part.write_bytes(b'X'+original[1:])
-            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'spec',{})
-            part.unlink()
-            with self.assertRaises(cache.CacheMismatch):cache.verify_cache(path)
-            m['parts'][0]['name']='../outside'
-            (path/'manifest.json').write_text(json.dumps(m))
-            with self.assertRaises(cache.CacheMismatch):cache.read_manifest(path)
-
-    def test_overwrite_refuses_unknown_files_and_respects_github_budget(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'cache';cache.save_cache(path,dict(a=torch.arange(3)),'spec')
-            unknown=path/'user-notes.txt';unknown.write_text('keep me')
-            with self.assertRaises(ValueError):cache.save_cache(path,dict(a=1),'spec',overwrite=True)
-            self.assertEqual(unknown.read_text(),'keep me')
-            with self.assertRaises(ValueError):cache.publish_cache(path,Path(temp)/'unused',budget=1)
-            self.assertFalse((Path(temp)/'unused').exists())
+            path=Path(temp)/'cache.pt';cache.save_cache(path,dict(a=1),'spec')
+            with self.assertRaises(FileExistsError):cache.save_cache(path,dict(a=2),'spec')
+            with patch.object(cache.torch,'save',side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):cache.save_cache(path,dict(a=2),'spec',overwrite=True)
+            self.assertEqual(cache.load_cache(path,'spec',{}),dict(a=1))
+            cache.save_cache(path,dict(a=2),'spec',overwrite=True)
+            self.assertEqual(cache.load_cache(path,'spec',{}),dict(a=2))
 
     def test_fingerprint_ignores_model_parameters_but_detects_window_changes(self):
         original=json.loads(NOTEBOOK.read_text())
@@ -191,23 +178,5 @@ class DatasetCacheTests(unittest.TestCase):
         self.assertTrue(np.isfinite(ns['stacked_metrics']['skill_vs_persistence']))
         self.assertEqual(len(ns['buytime_results']),4)
         self.assertEqual(len(ns['tabular_sequential_results']),3)
-
-    def test_publisher_commits_only_artifacts_and_uses_non_force_push(self):
-        def git(repo,*args):return subprocess.run(['git','-C',str(repo),*args],check=True,text=True,capture_output=True).stdout.strip()
-        with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);repo=root/'repo';bare=root/'remote.git'
-            subprocess.run(['git','init','--bare',str(bare)],check=True,capture_output=True)
-            subprocess.run(['git','init','-b','main',str(repo)],check=True,capture_output=True)
-            git(repo,'config','user.name','Cache test');git(repo,'config','user.email','cache-test@example.invalid')
-            (repo/'README.md').write_text('test repository')
-            git(repo,'add','README.md');git(repo,'commit','-m','initial');git(repo,'remote','add','origin',str(bare))
-            source=root/'cache';cache.save_cache(source,dict(dataset=torch.arange(4)),'spec')
-            sha=cache.publish_cache(source,repo)
-            self.assertEqual(git(repo,'rev-parse','HEAD'),sha)
-            self.assertEqual(git(bare,'rev-parse','refs/heads/main'),sha)
-            names=git(repo,'show','--pretty=format:','--name-only','HEAD').splitlines()
-            self.assertTrue(all(name.startswith('datasets/prepared/') for name in names if name))
-            (repo/'notes.txt').write_text('unrelated');git(repo,'add','notes.txt')
-            with self.assertRaises(ValueError):cache.publish_cache(source,repo)
 
 if __name__=='__main__':unittest.main()

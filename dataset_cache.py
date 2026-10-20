@@ -12,18 +12,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import shutil
-import subprocess
 import tempfile
-import zipfile
 import numpy as np
 import pandas as pd
 import torch
 
-FORMAT_VERSION = 1
-PART_BYTES = 40 * 1024**2
-GITHUB_BUDGET = 500 * 1024**2
+FORMAT_VERSION = 2
 NOTEBOOK_NAME = 'Gabor_Galovics_Thesis_work_3_FIXED(2).ipynb'
 DATA_CLASSES = {'BuyTimeRecord', 'TabularBuyEpisode'}
 # Stable source cell metadata IDs; populated by the notebook update script.
@@ -105,96 +99,31 @@ def _decode(value, registry, memo=None):
     return result
 
 
-def _sha(path):
-    digest=hashlib.sha256()
-    with open(path,'rb') as stream:
-        for block in iter(lambda:stream.read(1024**2),b''): digest.update(block)
-    return digest.hexdigest()
-
-
-def save_cache(path, state, fingerprint, *, part_bytes=PART_BYTES, overwrite=False):
-    """Atomically save one logical archive in GitHub-sized parts. Never stage/push implicitly."""
+def save_cache(path, state, fingerprint, *, overwrite=False):
+    """Save every prepared split in one Drive file, replacing it only after a full write."""
     path=Path(path)
-    if part_bytes<1 or part_bytes>=100*1024**2: raise ValueError('Parts must be below GitHub\'s 100 MiB limit.')
-    if path.exists():
-        if not overwrite: raise FileExistsError('Cache exists; explicitly rebuild/overwrite it.')
-        old=read_manifest(path)
-        expected={'manifest.json'}|{p['name'] for p in old['parts']}
-        if {p.name for p in path.iterdir()}!=expected: raise ValueError('Refusing to overwrite unexpected user files.')
-        verify_cache(path,old)
+    if path.exists() and not overwrite:
+        raise FileExistsError('Cache exists; explicitly rebuild/overwrite it.')
     path.parent.mkdir(parents=True,exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='dataset-cache-') as work:
-        work=Path(work)
-        payload=work/'datasets.pt'
-        torch.save(_encode(state),payload)
-        archive=work/'datasets.zip'
-        with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
-            z.write(payload,'datasets.pt')
-        ready=work/'ready';ready.mkdir()
-        parts=[]
-        with archive.open('rb') as stream:
-            index=0
-            while block:=stream.read(part_bytes):
-                name=f'datasets-{index:05d}.part'
-                target=ready/name;target.write_bytes(block)
-                parts.append(dict(name=name,bytes=len(block),sha256=_sha(target)))
-                index+=1
-        manifest=dict(format_version=FORMAT_VERSION,fingerprint=fingerprint,
-                      created_utc=datetime.now(timezone.utc).isoformat(),
-                      archive_sha256=_sha(archive),payload_sha256=_sha(payload),
-                      payload_bytes=payload.stat().st_size,compressed_bytes=archive.stat().st_size,
-                      parts=parts,sections=sorted(state))
-        (ready/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
-        # Stage on the destination filesystem, preserving the previous owned cache until ready.
-        staging=Path(tempfile.mkdtemp(prefix='.cache-ready-',dir=path.parent))
-        try:
-            for file in ready.iterdir(): shutil.copy2(file,staging/file.name)
-            if path.exists():
-                backup=Path(tempfile.mkdtemp(prefix='previous-dataset-cache-'))/'cache'
-                shutil.move(str(path),str(backup))  # recoverable old cache; never discard blindly
-            os.replace(staging,path)
-        finally:
-            if staging.exists(): shutil.rmtree(staging)
-    return manifest
-
-
-def read_manifest(path):
-    manifest=json.loads((Path(path)/'manifest.json').read_text())
-    if manifest.get('format_version')!=FORMAT_VERSION: raise CacheMismatch('Unsupported dataset cache version.')
-    if not manifest.get('parts'): raise CacheMismatch('Empty dataset archive.')
-    names=[p['name'] for p in manifest['parts']]
-    if len(names)!=len(set(names)) or any(not re.fullmatch(r'datasets-\d{5}\.part',name) for name in names):
-        raise CacheMismatch('Invalid archive part names.')
-    return manifest
-
-
-def verify_cache(path, manifest=None):
-    path=Path(path);manifest=manifest or read_manifest(path)
-    for part in manifest['parts']:
-        file=path/part['name']
-        if not file.is_file() or file.is_symlink() or file.stat().st_size!=part['bytes'] or _sha(file)!=part['sha256']:
-            raise CacheMismatch(f'Corrupt or changed cache part: {part["name"]}')
-    return manifest
+    payload=dict(format_version=FORMAT_VERSION,fingerprint=fingerprint,state=_encode(state))
+    descriptor,temporary=tempfile.mkstemp(prefix='.prepared-',suffix='.pt',dir=path.parent)
+    os.close(descriptor)
+    try:
+        torch.save(payload,temporary)
+        os.replace(temporary,path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return dict(bytes=path.stat().st_size)
 
 
 def load_cache(path, fingerprint, registry):
-    path=Path(path);manifest=read_manifest(path)
-    if manifest['fingerprint']!=fingerprint: raise CacheMismatch('Preparation code/source ID changed; rebuild datasets.')
-    verify_cache(path,manifest)
-    with tempfile.TemporaryDirectory(prefix='dataset-cache-load-') as work:
-        archive=Path(work)/'datasets.zip'
-        with archive.open('wb') as out:
-            for part in manifest['parts']:
-                with (path/part['name']).open('rb') as inp: shutil.copyfileobj(inp,out)
-        if _sha(archive)!=manifest['archive_sha256']: raise CacheMismatch('Archive checksum mismatch.')
-        payload=Path(work)/'datasets.pt'
-        with zipfile.ZipFile(archive) as z:
-            if z.namelist()!=['datasets.pt'] or z.getinfo('datasets.pt').file_size!=manifest['payload_bytes']:
-                raise CacheMismatch('Unexpected dataset archive contents.')
-            with z.open('datasets.pt') as inp,payload.open('wb') as out: shutil.copyfileobj(inp,out)
-        if _sha(payload)!=manifest['payload_sha256']: raise CacheMismatch('Payload checksum mismatch.')
-        encoded=torch.load(payload,map_location='cpu',weights_only=True)
-    return _decode(encoded,registry)
+    """Load a single model-input file using Torch's restricted decoder."""
+    payload=torch.load(Path(path),map_location='cpu',weights_only=True)
+    if payload.get('format_version')!=FORMAT_VERSION:
+        raise CacheMismatch('Unsupported dataset cache version; rebuild datasets.')
+    if payload.get('fingerprint')!=fingerprint:
+        raise CacheMismatch('Preparation code/source ID changed; rebuild datasets.')
+    return _decode(payload['state'],registry)
 
 
 def source_cells(notebook):
@@ -340,32 +269,3 @@ def build_model_data(ns,notebook):
         source=unguarded_source(cells[identifier])
         exec(compile(source,str(notebook),'exec'),ns)
     return snapshot_model_data(ns)
-
-
-def publish_cache(path,repo,*,budget=GITHUB_BUDGET):
-    """Explicitly publish only verified cache artifacts; no force pushes or credential handling."""
-    path,repo=Path(path).resolve(),Path(repo).resolve()
-    manifest=verify_cache(path)
-    if manifest['compressed_bytes']>budget:
-        raise ValueError(f'Cache is {manifest["compressed_bytes"]/1024**2:.1f} MiB: keep it on Drive '
-                         'instead of adding this much data to GitHub history.')
-    env=dict(os.environ,GIT_TERMINAL_PROMPT='0')
-    def git(*args):
-        return subprocess.run(['git','-C',str(repo),*args],env=env,text=True,capture_output=True,check=True).stdout.strip()
-    if git('diff','--cached','--name-only'):raise ValueError('Unrelated staged changes: commit them separately first.')
-    destination=repo/'datasets'/'prepared'
-    if path!=destination:
-        if destination.exists():
-            previous=verify_cache(destination)
-            expected={'manifest.json'}|{p['name'] for p in previous['parts']}
-            if {p.name for p in destination.iterdir()}!=expected:
-                raise ValueError('Unexpected files in the repository cache; preserve them separately.')
-            backup=Path(tempfile.mkdtemp(prefix='previous-repository-cache-'))/'cache'
-            shutil.move(str(destination),str(backup))
-        shutil.copytree(path,destination)
-    relative='datasets/prepared'
-    git('add','--all','--',relative)
-    if git('diff','--cached','--name-only'):
-        git('commit','-m','Cache prepared train validation calibration and test datasets','--',relative)
-    git('push','origin','HEAD:main')  # fails safely if remote advanced or authentication is unavailable
-    return git('rev-parse','HEAD')
