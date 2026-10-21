@@ -124,6 +124,30 @@ class DatasetCacheTests(unittest.TestCase):
             part.write_bytes(b'broken')
             with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{},legacy_fingerprint='legacy')
 
+    def test_startup_replaces_stale_import_with_matching_git_snapshot(self):
+        import subprocess
+        startup=next(''.join(c['source']) for c in CELLS if ''.join(c.get('source',[])).startswith('# Dataset cache startup'))
+        prefix=startup[:startup.index('DATASET_CACHE_BUILD_IDS =')]
+        files={'dataset_cache.py':Path(cache.__file__).read_bytes(),
+               cache.NOTEBOOK_NAME:NOTEBOOK.read_bytes()}
+        def git_output(command,**kwargs):
+            if 'rev-parse' in command:return 'syntheticrevision123\n'
+            if 'show' in command:return files[command[-1].split(':',1)[1]]
+            raise AssertionError(command)
+        stale=ModuleType('dataset_cache')
+        runtime=ModuleType('cache_startup_test')
+        ns=runtime.__dict__
+        with patch.dict(sys.modules,{'dataset_cache':stale,'cache_startup_test':runtime}), \
+             patch.object(subprocess,'run',return_value=subprocess.CompletedProcess([],0)), \
+             patch.object(subprocess,'check_output',side_effect=git_output), \
+             contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(prefix,'startup','exec'),ns)
+            self.assertIsNot(ns['model_cache'],stale)
+            self.assertIs(sys.modules['dataset_cache'],ns['model_cache'])
+            self.assertIn('legacy_fingerprint',__import__('inspect').signature(ns['model_cache'].load_cache).parameters)
+            self.assertEqual(ns['DATASET_CACHE_FINGERPRINT'],cache.preparation_fingerprint(NOTEBOOK))
+            ns['DATASET_CACHE_SOURCE_SNAPSHOT'].cleanup()
+
     def test_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'cache.pt';cache.save_cache(path,dict(a=torch.arange(3)),'old')
