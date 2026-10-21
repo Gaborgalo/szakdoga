@@ -13,6 +13,9 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import re
+import shutil
+import zipfile
 import numpy as np
 import pandas as pd
 import torch
@@ -102,6 +105,8 @@ def _decode(value, registry, memo=None):
 def save_cache(path, state, fingerprint, *, overwrite=False):
     """Save every prepared split in one Drive file, replacing it only after a full write."""
     path=Path(path)
+    if path.is_dir():
+        raise IsADirectoryError('An older cache directory exists here. Load it directly, or choose a different filename for a rebuild; existing data was preserved.')
     if path.exists() and not overwrite:
         raise FileExistsError('Cache exists; explicitly rebuild/overwrite it.')
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -116,14 +121,62 @@ def save_cache(path, state, fingerprint, *, overwrite=False):
     return dict(bytes=path.stat().st_size)
 
 
-def load_cache(path, fingerprint, registry):
+def load_cache(path, fingerprint, registry, *, legacy_fingerprint=None):
     """Load a single model-input file using Torch's restricted decoder."""
+    if Path(path).is_dir():
+        return _load_legacy_cache(path,legacy_fingerprint or fingerprint,registry)
     payload=torch.load(Path(path),map_location='cpu',weights_only=True)
     if payload.get('format_version')!=FORMAT_VERSION:
         raise CacheMismatch('Unsupported dataset cache version; rebuild datasets.')
     if payload.get('fingerprint')!=fingerprint:
         raise CacheMismatch('Preparation code/source ID changed; rebuild datasets.')
     return _decode(payload['state'],registry)
+
+
+def _sha(path):
+    digest=hashlib.sha256()
+    with open(path,'rb') as stream:
+        for block in iter(lambda:stream.read(1024**2),b''): digest.update(block)
+    return digest.hexdigest()
+
+
+def read_manifest(path):
+    manifest=json.loads((Path(path)/'manifest.json').read_text())
+    if manifest.get('format_version')!=1: raise CacheMismatch('Unsupported dataset cache version.')
+    if not manifest.get('parts'): raise CacheMismatch('Empty dataset archive.')
+    names=[p['name'] for p in manifest['parts']]
+    if len(names)!=len(set(names)) or any(not re.fullmatch(r'datasets-\d{5}\.part',name) for name in names):
+        raise CacheMismatch('Invalid archive part names.')
+    return manifest
+
+
+def verify_cache(path, manifest=None):
+    path=Path(path);manifest=manifest or read_manifest(path)
+    for part in manifest['parts']:
+        file=path/part['name']
+        if not file.is_file() or file.is_symlink() or file.stat().st_size!=part['bytes'] or _sha(file)!=part['sha256']:
+            raise CacheMismatch(f'Corrupt or changed cache part: {part["name"]}')
+    return manifest
+
+
+def _load_legacy_cache(path, fingerprint, registry):
+    path=Path(path);manifest=read_manifest(path)
+    if manifest['fingerprint']!=fingerprint: raise CacheMismatch('Preparation code/source ID changed; rebuild datasets.')
+    verify_cache(path,manifest)
+    with tempfile.TemporaryDirectory(prefix='dataset-cache-load-') as work:
+        archive=Path(work)/'datasets.zip'
+        with archive.open('wb') as out:
+            for part in manifest['parts']:
+                with (path/part['name']).open('rb') as inp: shutil.copyfileobj(inp,out)
+        if _sha(archive)!=manifest['archive_sha256']: raise CacheMismatch('Archive checksum mismatch.')
+        payload=Path(work)/'datasets.pt'
+        with zipfile.ZipFile(archive) as z:
+            if z.namelist()!=['datasets.pt'] or z.getinfo('datasets.pt').file_size!=manifest['payload_bytes']:
+                raise CacheMismatch('Unexpected dataset archive contents.')
+            with z.open('datasets.pt') as inp,payload.open('wb') as out: shutil.copyfileobj(inp,out)
+        if _sha(payload)!=manifest['payload_sha256']: raise CacheMismatch('Payload checksum mismatch.')
+        encoded=torch.load(payload,map_location='cpu',weights_only=True)
+    return _decode(encoded,registry)
 
 
 def source_cells(notebook):
@@ -140,7 +193,7 @@ def unguarded_source(source):
     return ast.unparse(ast.Module(body=node.body,type_ignores=[]))+'\n'
 
 
-def preparation_fingerprint(notebook,source_id='airfare-top5-v1'):
+def preparation_fingerprint(notebook,source_id='airfare-top5-v1', *, format_version=FORMAT_VERSION):
     cells=source_cells(notebook);pieces=[]
     for identifier in PREPARATION_IDS:
         tree=ast.parse(unguarded_source(cells[identifier]))
@@ -154,7 +207,7 @@ def preparation_fingerprint(notebook,source_id='airfare-top5-v1'):
                 names=[t.id for t in node.targets if isinstance(t,ast.Name)]
                 if any(name.startswith(('BUYTIME_','FUTURE_HORIZON','TABULAR_Q_MAX','MATCH_TRAINING_TARGETS','DL_TRAIN_WINDOW_STRIDE','DL_MAX_TRAIN_WINDOWS_PER_ITINERARY')) for name in names): nodes.append(node)
         pieces.append(ast.dump(ast.Module(body=nodes,type_ignores=[]),include_attributes=False))
-    return hashlib.sha256(json.dumps([FORMAT_VERSION,source_id,pieces],sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([format_version,source_id,pieces],sort_keys=True).encode()).hexdigest()
 
 
 def bootstrap_definitions(namespace,notebook):

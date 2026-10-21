@@ -105,6 +105,25 @@ class DatasetCacheTests(unittest.TestCase):
             self.assertEqual(cache.load_cache(path,'spec',{})['values'],[1.2,3,True,date(2022,1,1)])
         with self.assertRaises(TypeError):cache._encode(torch.nn.Linear(2,1))
 
+    def test_legacy_directory_loads_and_checks_integrity(self):
+        import hashlib, zipfile
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'prepared.pt';path.mkdir()
+            payload=root/'datasets.pt';archive=root/'datasets.zip'
+            torch.save(cache._encode(dict(a=np.arange(3))),payload)
+            with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED) as z:
+                z.write(payload,'datasets.pt')
+            part=path/'datasets-00000.part';part.write_bytes(archive.read_bytes())
+            sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+            manifest=dict(format_version=1,fingerprint='legacy',parts=[dict(name=part.name,bytes=part.stat().st_size,sha256=sha(part))],archive_sha256=sha(archive),payload_sha256=sha(payload),payload_bytes=payload.stat().st_size)
+            (path/'manifest.json').write_text(json.dumps(manifest))
+            loaded=cache.load_cache(path,'new',{},legacy_fingerprint='legacy')
+            np.testing.assert_array_equal(loaded['a'],np.arange(3))
+            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{})
+            with self.assertRaises(IsADirectoryError):cache.save_cache(path,dict(a=1),'new',overwrite=True)
+            part.write_bytes(b'broken')
+            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{},legacy_fingerprint='legacy')
+
     def test_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'cache.pt';cache.save_cache(path,dict(a=torch.arange(3)),'old')
