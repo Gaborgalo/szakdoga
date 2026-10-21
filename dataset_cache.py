@@ -24,14 +24,7 @@ FORMAT_VERSION = 2
 NOTEBOOK_NAME = 'Gabor_Galovics_Thesis_work_3_FIXED(2).ipynb'
 DATA_CLASSES = {'BuyTimeRecord', 'TabularBuyEpisode'}
 # Stable source cell metadata IDs; populated by the notebook update script.
-PREPARATION_IDS = ['tq5Q2C_VG9Qh', '6w-Rx8h_WQQ3', 'CaYKEmaCVkgv', '4uiZw7k7s4_0', '4CBntgUEKZnu', 'Ih1rlefwbua0', '0f1PugSYyE06', 'r1nWr79-sbbQ', '1_saZgBSr0HO', 'SGd0z2VVr0HP', 'YAkOmH9MarQQ', 'K8RoQ9aGtbJ-', 'cde782f4', 'uO6BL8LJr0Hf', 'efa6586699d3']
 HELPER_IDS = ['0f1PugSYyE06', '810jqa5ur0HN', 'SGd0z2VVr0HP', 'K8RoQ9aGtbJ-', 'cde782f4', 'FV3nCwAar0HX', 'eRJ5kwO_r0Hc', 'HWpa7YkIr0He', 'd7dbdb5e0b7d']
-FINGERPRINT_HELPERS = {
- 'BuyTimeRecord','BuyTimeDataset','buytime_collate','make_buytime_records','make_buytime_bundle',
- 'TabularBuyEpisode','tabular_history_features','prepare_tabular_q_data','tabular_q_states',
- 'tabular_q_prediction_data','CustomSequenceDataset','sequence_collate_fn','spark_sequences_to_variable_numpy',
- 'assert_matched_targets'}
-
 class CacheMismatch(ValueError):
     pass
 
@@ -102,7 +95,7 @@ def _decode(value, registry, memo=None):
     return result
 
 
-def save_cache(path, state, fingerprint, *, overwrite=False):
+def save_cache(path, state, *, overwrite=False):
     """Save every prepared split in one Drive file, replacing it only after a full write."""
     path=Path(path)
     if path.is_dir():
@@ -110,7 +103,7 @@ def save_cache(path, state, fingerprint, *, overwrite=False):
     if path.exists() and not overwrite:
         raise FileExistsError('Cache exists; explicitly rebuild/overwrite it.')
     path.parent.mkdir(parents=True,exist_ok=True)
-    payload=dict(format_version=FORMAT_VERSION,fingerprint=fingerprint,state=_encode(state))
+    payload=dict(format_version=FORMAT_VERSION,state=_encode(state))
     descriptor,temporary=tempfile.mkstemp(prefix='.prepared-',suffix='.pt',dir=path.parent)
     os.close(descriptor)
     try:
@@ -121,15 +114,13 @@ def save_cache(path, state, fingerprint, *, overwrite=False):
     return dict(bytes=path.stat().st_size)
 
 
-def load_cache(path, fingerprint, registry, *, legacy_fingerprint=None):
+def load_cache(path, registry):
     """Load a single model-input file using Torch's restricted decoder."""
     if Path(path).is_dir():
-        return _load_legacy_cache(path,legacy_fingerprint or fingerprint,registry)
+        return _load_legacy_cache(path,registry)
     payload=torch.load(Path(path),map_location='cpu',weights_only=True)
     if payload.get('format_version')!=FORMAT_VERSION:
         raise CacheMismatch('Unsupported dataset cache version; rebuild datasets.')
-    if payload.get('fingerprint')!=fingerprint:
-        raise CacheMismatch('Preparation code/source ID changed; rebuild datasets.')
     return _decode(payload['state'],registry)
 
 
@@ -159,9 +150,8 @@ def verify_cache(path, manifest=None):
     return manifest
 
 
-def _load_legacy_cache(path, fingerprint, registry):
+def _load_legacy_cache(path, registry):
     path=Path(path);manifest=read_manifest(path)
-    if manifest['fingerprint']!=fingerprint: raise CacheMismatch('Preparation code/source ID changed; rebuild datasets.')
     verify_cache(path,manifest)
     with tempfile.TemporaryDirectory(prefix='dataset-cache-load-') as work:
         archive=Path(work)/'datasets.zip'
@@ -185,29 +175,12 @@ def source_cells(notebook):
 
 
 def unguarded_source(source):
-    """Remove only our cache guard; preserve the original source for one-time building/fingerprinting."""
+    """Remove only our cache guard; preserve the original source for one-time building."""
     if '# DATASET-CACHE-GUARD' not in source: return source
     tree=ast.parse(source)
     node=tree.body[0]
     if not isinstance(node,ast.If): raise ValueError('Invalid dataset cache guard.')
     return ast.unparse(ast.Module(body=node.body,type_ignores=[]))+'\n'
-
-
-def preparation_fingerprint(notebook,source_id='airfare-top5-v1', *, format_version=FORMAT_VERSION):
-    cells=source_cells(notebook);pieces=[]
-    for identifier in PREPARATION_IDS:
-        tree=ast.parse(unguarded_source(cells[identifier]))
-        pieces.append(ast.dump(tree,include_attributes=False))
-    for identifier in HELPER_IDS:
-        tree=ast.parse(unguarded_source(cells[identifier]))
-        nodes=[]
-        for node in tree.body:
-            if isinstance(node,(ast.ClassDef,ast.FunctionDef)) and node.name in FINGERPRINT_HELPERS: nodes.append(node)
-            if isinstance(node,ast.Assign):
-                names=[t.id for t in node.targets if isinstance(t,ast.Name)]
-                if any(name.startswith(('BUYTIME_','FUTURE_HORIZON','TABULAR_Q_MAX','MATCH_TRAINING_TARGETS','DL_TRAIN_WINDOW_STRIDE','DL_MAX_TRAIN_WINDOWS_PER_ITINERARY')) for name in names): nodes.append(node)
-        pieces.append(ast.dump(ast.Module(body=nodes,type_ignores=[]),include_attributes=False))
-    return hashlib.sha256(json.dumps([format_version,source_id,pieces],sort_keys=True).encode()).hexdigest()
 
 
 def bootstrap_definitions(namespace,notebook):
@@ -317,7 +290,7 @@ def restore_model_data(state,ns):
 def build_model_data(ns,notebook):
     """Execute only preparation cells in dependency order, never model training/EDA plots/Optuna."""
     cells=source_cells(notebook)
-    # Imports/Drive/Spark startup are prep-only and do not belong in the fingerprint.
+    # Execute only data preparation, without fitting any models.
     for identifier in ns['DATASET_CACHE_BUILD_IDS']:
         source=unguarded_source(cells[identifier])
         exec(compile(source,str(notebook),'exec'),ns)

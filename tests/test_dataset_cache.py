@@ -80,11 +80,11 @@ class DatasetCacheTests(unittest.TestCase):
         state,_=snapshot_fixture()
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'cache'
-            cache.save_cache(path,state,'fixture')
+            cache.save_cache(path,state)
             self.assertTrue(path.is_file())
             ns=namespace()
             with patch.object(cache.torch,'load',wraps=cache.torch.load) as loader:
-                loaded=cache.load_cache(path,'fixture',{name:ns[name] for name in cache.DATA_CLASSES})
+                loaded=cache.load_cache(path,{name:ns[name] for name in cache.DATA_CLASSES})
                 self.assertTrue(loader.call_args.kwargs['weights_only'])
             cache.restore_model_data(loaded,ns)
             np.testing.assert_array_equal(ns['X_train_np'],state['price']['train']['X'])
@@ -101,8 +101,8 @@ class DatasetCacheTests(unittest.TestCase):
     def test_numpy_scalars_and_dates_use_restricted_compatible_encoding(self):
         state=dict(values=[np.float64(1.2),np.int64(3),np.bool_(True),date(2022,1,1)])
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'cache';cache.save_cache(path,state,'spec')
-            self.assertEqual(cache.load_cache(path,'spec',{})['values'],[1.2,3,True,date(2022,1,1)])
+            path=Path(temp)/'cache';cache.save_cache(path,state)
+            self.assertEqual(cache.load_cache(path,{})['values'],[1.2,3,True,date(2022,1,1)])
         with self.assertRaises(TypeError):cache._encode(torch.nn.Linear(2,1))
 
     def test_legacy_directory_loads_and_checks_integrity(self):
@@ -117,12 +117,11 @@ class DatasetCacheTests(unittest.TestCase):
             sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
             manifest=dict(format_version=1,fingerprint='legacy',parts=[dict(name=part.name,bytes=part.stat().st_size,sha256=sha(part))],archive_sha256=sha(archive),payload_sha256=sha(payload),payload_bytes=payload.stat().st_size)
             (path/'manifest.json').write_text(json.dumps(manifest))
-            loaded=cache.load_cache(path,'new',{},legacy_fingerprint='legacy')
+            loaded=cache.load_cache(path,{})
             np.testing.assert_array_equal(loaded['a'],np.arange(3))
-            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{})
-            with self.assertRaises(IsADirectoryError):cache.save_cache(path,dict(a=1),'new',overwrite=True)
+            with self.assertRaises(IsADirectoryError):cache.save_cache(path,dict(a=1),overwrite=True)
             part.write_bytes(b'broken')
-            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{},legacy_fingerprint='legacy')
+            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,{})
 
     def test_startup_replaces_stale_import_with_matching_git_snapshot(self):
         import subprocess
@@ -144,39 +143,24 @@ class DatasetCacheTests(unittest.TestCase):
             exec(compile(prefix,'startup','exec'),ns)
             self.assertIsNot(ns['model_cache'],stale)
             self.assertIs(sys.modules['dataset_cache'],ns['model_cache'])
-            self.assertIn('legacy_fingerprint',__import__('inspect').signature(ns['model_cache'].load_cache).parameters)
-            self.assertEqual(ns['DATASET_CACHE_FINGERPRINT'],cache.preparation_fingerprint(NOTEBOOK))
+            self.assertEqual(list(__import__('inspect').signature(ns['model_cache'].load_cache).parameters),['path','registry'])
             ns['DATASET_CACHE_SOURCE_SNAPSHOT'].cleanup()
 
-    def test_mismatch_is_rejected(self):
+    def test_stored_fingerprint_is_ignored_for_existing_files(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'cache.pt';cache.save_cache(path,dict(a=torch.arange(3)),'old')
-            with self.assertRaises(cache.CacheMismatch):cache.load_cache(path,'new',{})
+            path=Path(temp)/'cache.pt'
+            torch.save(dict(format_version=2,fingerprint='old preparation code',state=cache._encode(dict(a=3))),path)
+            self.assertEqual(cache.load_cache(path,{}),dict(a=3))
 
     def test_failed_save_preserves_previous_file(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'cache.pt';cache.save_cache(path,dict(a=1),'spec')
-            with self.assertRaises(FileExistsError):cache.save_cache(path,dict(a=2),'spec')
+            path=Path(temp)/'cache.pt';cache.save_cache(path,dict(a=1))
+            with self.assertRaises(FileExistsError):cache.save_cache(path,dict(a=2))
             with patch.object(cache.torch,'save',side_effect=OSError('disk full')):
-                with self.assertRaises(OSError):cache.save_cache(path,dict(a=2),'spec',overwrite=True)
-            self.assertEqual(cache.load_cache(path,'spec',{}),dict(a=1))
-            cache.save_cache(path,dict(a=2),'spec',overwrite=True)
-            self.assertEqual(cache.load_cache(path,'spec',{}),dict(a=2))
-
-    def test_fingerprint_ignores_model_parameters_but_detects_window_changes(self):
-        original=json.loads(NOTEBOOK.read_text())
-        with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'notebook.ipynb';path.write_text(json.dumps(original))
-            first=cache.preparation_fingerprint(path)
-            changed=copy.deepcopy(original)
-            c=next(c for c in changed['cells'] if ''.join(c['source']).startswith('# Fixed parameters and independent'))
-            c['source']=''.join(c['source']).replace("'n_estimators': 500","'n_estimators': 501").splitlines(keepends=True)
-            path.write_text(json.dumps(changed));self.assertEqual(first,cache.preparation_fingerprint(path))
-            for c in changed['cells']:
-                s=''.join(c['source'])
-                if 'SEQUENCE_LENGTH = 10' in s:c['source']=s.replace('SEQUENCE_LENGTH = 10','SEQUENCE_LENGTH = 8').splitlines(keepends=True)
-            path.write_text(json.dumps(changed));self.assertNotEqual(first,cache.preparation_fingerprint(path))
-            self.assertNotEqual(first,cache.preparation_fingerprint(NOTEBOOK,'new-data-version'))
+                with self.assertRaises(OSError):cache.save_cache(path,dict(a=2),overwrite=True)
+            self.assertEqual(cache.load_cache(path,{}),dict(a=1))
+            cache.save_cache(path,dict(a=2),overwrite=True)
+            self.assertEqual(cache.load_cache(path,{}),dict(a=2))
 
     def test_cache_hit_skips_all_raw_preparation_without_spark(self):
         from IPython.core.inputtransformer2 import TransformerManager
@@ -193,8 +177,8 @@ class DatasetCacheTests(unittest.TestCase):
     def test_fresh_restored_runtime_trains_and_evaluates_every_model_family(self):
         state,_=snapshot_fixture();ns=namespace()
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'cache';cache.save_cache(path,state,'spec')
-            state=cache.load_cache(path,'spec',{name:ns[name] for name in cache.DATA_CLASSES})
+            path=Path(temp)/'cache';cache.save_cache(path,state)
+            state=cache.load_cache(path,{name:ns[name] for name in cache.DATA_CLASSES})
             cache.restore_model_data(state,ns)
             ns['best_xgboost_params_global']=dict(n_estimators=4,max_depth=2,learning_rate=.1)
             ns['best_xgboost_params_no_ts']=dict(n_estimators=4,max_depth=2,learning_rate=.1)
