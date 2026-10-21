@@ -190,6 +190,8 @@ class DatasetCacheTests(unittest.TestCase):
                 os.chdir(temp)
                 with contextlib.redirect_stdout(io.StringIO()):
                     for c in CELLS:
+                        if c['cell_type'] != 'code':
+                            continue
                         s=''.join(c['source'])
                         if any(marker in s for marker in (
                             '# Optional baseline fit/evaluation;', '# Optional no-time-series fit/evaluation;',

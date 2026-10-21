@@ -1,9 +1,4 @@
-"""Versioned model-input caches for the thesis notebook; no model weights or credentials.
-
-The on-disk payload contains only primitive containers and CPU tensors. It is loaded
-with torch's restricted weights_only unpickler; registered data classes are rebuilt
-explicitly afterward. Tensor storage sharing (including overlapping windows) survives.
-"""
+"""Save and restore prepared notebook inputs using CPU tensors and restricted loading."""
 from __future__ import annotations
 import ast
 from dataclasses import fields, is_dataclass
@@ -23,7 +18,7 @@ import torch
 FORMAT_VERSION = 2
 NOTEBOOK_NAME = 'Gabor_Galovics_Thesis_work_3_FIXED(2).ipynb'
 DATA_CLASSES = {'BuyTimeRecord', 'TabularBuyEpisode'}
-# Stable source cell metadata IDs; populated by the notebook update script.
+# Helper cell IDs used to restore notebook definitions.
 HELPER_IDS = ['0f1PugSYyE06', '810jqa5ur0HN', 'SGd0z2VVr0HP', 'K8RoQ9aGtbJ-', 'cde782f4', 'FV3nCwAar0HX', 'eRJ5kwO_r0Hc', 'HWpa7YkIr0He', 'd7dbdb5e0b7d']
 class CacheMismatch(ValueError):
     pass
